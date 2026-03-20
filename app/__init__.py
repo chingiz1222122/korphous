@@ -1,0 +1,1 @@
+"""WB hiring bot package."""
