@@ -1,23 +1,36 @@
-# Telegram RAG Bot (Local)
+# Telegram Local Ingestion (Stage 1)
 
-## Что делает бот
-- Раз в 24 часа Telethon запускает **batch-парсинг только включенных каналов** (не личек).
-- Сырые сообщения сохраняются локально в SQLite (`./data/telegram.sqlite`).
-- Через Bot API (python-telegram-bot) доступны owner-only команды:
-  - `/chats` — показать каналы и переключить enable/disable.
-  - `/ask <вопрос>` — ответ по локальной базе за окно времени (по умолчанию 24ч).
-  - `/digest <hours>` — сводка важного за период.
-- Для ответов/сводок используется OpenAI, в ответе возвращаются ссылки на исходные сообщения.
+Stage 1 реализует только ingestion слой:
+- Telethon collector (user session)
+- надежный SQLite слой
+- backfill истории
 
-## Локальное хранение данных
-- Все данные живут только на вашем Mac в `SQLITE_PATH`.
-- Основные таблицы:
-  - `chats` — каталог каналов + флаг `enabled`.
-  - `messages` — спарсенные сообщения с `permalink`.
-  - `ingestion_state` — когда канал парсился в последний раз.
+## Что делает collector
+- Подключается как user через file session (`TELETHON_SESSION`).
+- Проверяет, что сессия не bot account.
+- Сидирует список чатов (group/supergroup/channel) в таблицу `chats`.
+- Игнорирует private dialogs.
+- Слушает `events.NewMessage` и сохраняет сообщения только из enabled-чатов.
+- Подхватывает изменения enabled через refresh кеша (без перезапуска).
 
-## Setup
+## База данных
+Таблицы:
+- `chats(chat_id, title, username, chat_type, enabled, updated_at)`
+- `messages(chat_id, msg_id, date_utc, sender_id, text, raw_json, created_at)`
+- `state(key, value, updated_at)`
 
+Надежность:
+- WAL mode
+- busy_timeout
+- retry на `database is locked`
+- composite PK `(chat_id, msg_id)` для защиты от дублей
+
+## Backfill
+- `backfill_chat(chat_id, days)` — точечный backfill.
+- `backfill_enabled_chats(days)` — bulk backfill по всем enabled чатам.
+- Повторный запуск не дублирует сообщения.
+
+## Setup (macOS, Python 3.11/3.12 recommended)
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -25,14 +38,17 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Заполните `.env` вашими ключами.
-
-## Run
-
+## Run collector
 ```bash
-python -m app.main
+python scripts/run_collector.py
 ```
 
-## Формат ссылок
-- Если у канала есть username: `https://t.me/<username>/<msg_id>`.
-- Иначе fallback: `https://t.me/c/<internal_id>/<msg_id>`.
+## Backfill one chat
+```bash
+python scripts/backfill_chat.py --chat-id -1001234567890 --days 7
+```
+
+## Backfill all enabled chats
+```bash
+python scripts/backfill_enabled.py --days 3
+```
