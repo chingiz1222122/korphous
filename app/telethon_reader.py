@@ -1,53 +1,82 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
-from telethon import TelegramClient, events
-from telethon.tl.types import Channel, Chat
+from telethon import TelegramClient
+from telethon.tl.types import Channel
 
 from app.config import Settings
-from app.db import ChatRecord, MessageRecord, get_enabled_chat_ids, init_db, insert_message, upsert_chat
+from app.db import (
+    ChatRecord,
+    MessageRecord,
+    get_enabled_chat_ids,
+    get_last_ingestion_run,
+    init_db,
+    insert_message,
+    set_last_ingestion_run,
+    upsert_chat,
+)
 from app.utils import format_message_link
 
 
 logger = logging.getLogger(__name__)
+SYNC_INTERVAL_SECONDS = 24 * 60 * 60
 
 
-def _is_group_or_channel(entity: object) -> bool:
-    return isinstance(entity, (Channel, Chat))
+def _is_channel(entity: object) -> bool:
+    return isinstance(entity, Channel) and bool(getattr(entity, "broadcast", False))
 
 
-async def _sync_dialogs(client: TelegramClient, settings: Settings) -> None:
+async def _sync_channels_catalog(client: TelegramClient, settings: Settings) -> None:
     async for dialog in client.iter_dialogs():
         entity = dialog.entity
-        if not _is_group_or_channel(entity):
+        if not _is_channel(entity):
             continue
-        chat_id = entity.id if hasattr(entity, "id") else dialog.id
-        username = getattr(entity, "username", None)
-        title = getattr(entity, "title", None) or dialog.name
         upsert_chat(
             settings.sqlite_path,
-            ChatRecord(chat_id=chat_id, title=title, username=username, enabled=False),
+            ChatRecord(
+                chat_id=entity.id,
+                title=getattr(entity, "title", dialog.name),
+                username=getattr(entity, "username", None),
+                enabled=False,
+            ),
         )
 
 
-def _message_record(
-    event: events.NewMessage.Event,
-    title: str,
-    username: str | None,
-    permalink: str,
-) -> MessageRecord:
+def _message_record(chat: Channel, message) -> MessageRecord:
     return MessageRecord(
-        chat_id=event.chat_id,
-        chat_title=title,
-        chat_username=username,
-        msg_id=event.id,
-        sender_id=event.sender_id,
-        date=event.message.date.astimezone(timezone.utc),
-        text=event.message.message or "",
-        permalink=permalink,
+        chat_id=chat.id,
+        chat_title=chat.title or "",
+        chat_username=getattr(chat, "username", None),
+        msg_id=message.id,
+        sender_id=message.sender_id,
+        date=message.date.astimezone(timezone.utc),
+        text=message.message or "",
+        permalink=format_message_link(chat.id, getattr(chat, "username", None), message.id),
     )
+
+
+async def _ingest_channel(client: TelegramClient, settings: Settings, chat_id: int) -> int:
+    chat = await client.get_entity(chat_id)
+    if not _is_channel(chat):
+        return 0
+
+    last_run = get_last_ingestion_run(settings.sqlite_path, chat_id)
+    default_start = datetime.now(timezone.utc) - timedelta(hours=24)
+    since = last_run or default_start
+
+    inserted = 0
+    async for message in client.iter_messages(chat, offset_date=since, reverse=True):
+        if not message.message or not message.message.strip():
+            continue
+        insert_message(settings.sqlite_path, _message_record(chat, message))
+        inserted += 1
+
+    set_last_ingestion_run(settings.sqlite_path, chat_id, datetime.now(timezone.utc))
+    logger.info("Ingested %s messages from channel %s", inserted, chat_id)
+    return inserted
 
 
 async def run_reader(settings: Settings) -> None:
@@ -59,30 +88,14 @@ async def run_reader(settings: Settings) -> None:
     )
 
     await client.start()
-    await _sync_dialogs(client, settings)
+    await _sync_channels_catalog(client, settings)
+    logger.info("Telethon daily channel ingester started")
 
-    @client.on(events.NewMessage())
-    async def handle_message(event: events.NewMessage.Event) -> None:
-        if event.is_private:
-            return
-        chat = await event.get_chat()
-        if not _is_group_or_channel(chat):
-            return
-        enabled_chat_ids = get_enabled_chat_ids(settings.sqlite_path)
-        if chat.id not in enabled_chat_ids:
-            return
-        message_text = event.message.message or ""
-        if not message_text.strip():
-            return
-        permalink = format_message_link(chat.id, getattr(chat, "username", None), event.id)
-        record = _message_record(
-            event,
-            title=chat.title or "",
-            username=getattr(chat, "username", None),
-            permalink=permalink,
-        )
-        insert_message(settings.sqlite_path, record)
-        logger.info("Saved message %s from chat %s", event.id, chat.id)
-
-    logger.info("Telethon reader started")
-    await client.run_until_disconnected()
+    while True:
+        try:
+            enabled_chat_ids = get_enabled_chat_ids(settings.sqlite_path)
+            for chat_id in enabled_chat_ids:
+                await _ingest_channel(client, settings, chat_id)
+        except Exception:
+            logger.exception("Daily ingest iteration failed")
+        await asyncio.sleep(SYNC_INTERVAL_SECONDS)

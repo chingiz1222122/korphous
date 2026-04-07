@@ -4,7 +4,6 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -57,7 +56,16 @@ def init_db(db_path: Path) -> None:
                 sender_id INTEGER,
                 date TEXT NOT NULL,
                 text TEXT NOT NULL,
-                permalink TEXT NOT NULL
+                permalink TEXT NOT NULL,
+                UNIQUE(chat_id, msg_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingestion_state (
+                chat_id INTEGER PRIMARY KEY,
+                last_run_at TEXT NOT NULL
             )
             """
         )
@@ -112,9 +120,7 @@ def list_chats(db_path: Path) -> list[ChatRecord]:
 
 def get_enabled_chat_ids(db_path: Path) -> set[int]:
     with _connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT chat_id FROM chats WHERE enabled = 1"
-        ).fetchall()
+        rows = conn.execute("SELECT chat_id FROM chats WHERE enabled = 1").fetchall()
     return {row["chat_id"] for row in rows}
 
 
@@ -122,7 +128,7 @@ def insert_message(db_path: Path, message: MessageRecord) -> None:
     with _connect(db_path) as conn:
         conn.execute(
             """
-            INSERT INTO messages (
+            INSERT OR IGNORE INTO messages (
                 chat_id, chat_title, chat_username, msg_id, sender_id, date, text, permalink
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -141,11 +147,7 @@ def insert_message(db_path: Path, message: MessageRecord) -> None:
         conn.commit()
 
 
-def fetch_messages(
-    db_path: Path,
-    since: datetime,
-    limit: int = 200,
-) -> list[MessageRecord]:
+def fetch_messages(db_path: Path, since: datetime, limit: int = 200) -> list[MessageRecord]:
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
@@ -157,23 +159,46 @@ def fetch_messages(
             """,
             (since.isoformat(), limit),
         ).fetchall()
-    messages: list[MessageRecord] = []
-    for row in rows:
-        messages.append(
-            MessageRecord(
-                chat_id=row["chat_id"],
-                chat_title=row["chat_title"],
-                chat_username=row["chat_username"],
-                msg_id=row["msg_id"],
-                sender_id=row["sender_id"],
-                date=datetime.fromisoformat(row["date"]),
-                text=row["text"],
-                permalink=row["permalink"],
-            )
+    return [
+        MessageRecord(
+            chat_id=row["chat_id"],
+            chat_title=row["chat_title"],
+            chat_username=row["chat_username"],
+            msg_id=row["msg_id"],
+            sender_id=row["sender_id"],
+            date=datetime.fromisoformat(row["date"]),
+            text=row["text"],
+            permalink=row["permalink"],
         )
-    return messages
+        for row in rows
+    ]
 
 
 def fetch_recent_messages(db_path: Path, hours: int, limit: int = 300) -> list[MessageRecord]:
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     return fetch_messages(db_path, since=since, limit=limit)
+
+
+def set_last_ingestion_run(db_path: Path, chat_id: int, when: datetime) -> None:
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (chat_id, last_run_at)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                last_run_at = excluded.last_run_at
+            """,
+            (chat_id, when.isoformat()),
+        )
+        conn.commit()
+
+
+def get_last_ingestion_run(db_path: Path, chat_id: int) -> datetime | None:
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT last_run_at FROM ingestion_state WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return datetime.fromisoformat(row["last_run_at"])

@@ -40,7 +40,7 @@ async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     keyboard = [[_format_chat_button(chat.chat_id, chat.title, chat.enabled)] for chat in chats]
     if update.message:
         await update.message.reply_text(
-            "Enable/disable chats:",
+            "Enable/disable channels:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
@@ -76,7 +76,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     args = context.args
     if not args:
-        await update.message.reply_text("Usage: /ask <question> [hours]")
+        await update.message.reply_text("Usage: /ask [hours] <question>")
         return
     hours = 24
     if args and args[0].isdigit():
